@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 import uvicorn
 
 # Configuration
-SERVER_ADDRESS = "collection-aj-baths-vegetables.trycloudflare.com/"
+SERVER_ADDRESS = "collection-aj-baths-vegetables.trycloudflare.com"
 QUEUE_URL = f"https://{SERVER_ADDRESS}/prompt"
 VIDEO_URL = f"https://{SERVER_ADDRESS}/view"
 UPLOAD_IMAGE_URL = f"https://{SERVER_ADDRESS}/upload/image"
