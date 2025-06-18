@@ -6,6 +6,7 @@ import copy
 from pathlib import Path
 from typing import Optional, Dict, Any, AsyncGenerator
 import re
+import os
 
 import requests
 import requests.exceptions
@@ -16,7 +17,7 @@ from sse_starlette.sse import EventSourceResponse
 import uvicorn
 
 # Configuration
-SERVER_ADDRESS = "cancel-theaters-crossing-tournament.trycloudflare.com"
+SERVER_ADDRESS = "interview-excellent-fp-providers.trycloudflare.com"
 QUEUE_URL = f"https://{SERVER_ADDRESS}/prompt"
 HISTORY_URL = f"https://{SERVER_ADDRESS}/history"
 VIDEO_URL = f"https://{SERVER_ADDRESS}/view"
@@ -48,6 +49,14 @@ HEADERS = {
     "Sec-Fetch-Site": "same-origin",
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
 }
+
+WS_OPEN_TIMEOUT   = int(os.getenv("WS_OPEN_TIMEOUT",   "60"))   # seconds
+WS_PING_INTERVAL  = int(os.getenv("WS_PING_INTERVAL",  "20"))
+WS_PING_TIMEOUT   = int(os.getenv("WS_PING_TIMEOUT",   "20"))
+WS_CLOSE_TIMEOUT  = int(os.getenv("WS_CLOSE_TIMEOUT",  "10"))
+MAX_RETRIES = 3
+BASE_DELAY  = 2  # seconds
+WS_SEMAPHORE      = asyncio.Semaphore(int(os.getenv("WS_MAX_CONCURRENCY", "10")))
 
 # -----------------------------------------------------------------------------
 # Exceptions
@@ -166,142 +175,151 @@ async def monitor_progress_unified(
     workflow_started = False
     workflow_completed = False
 
-    try:
-        async with websockets.connect(
-            ws_url, 
-            additional_headers=HEADERS, 
-            ping_interval=None, 
-            max_size=None
-        ) as ws:
-            while True:
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=5)
-                    idle = 0
-                except asyncio.TimeoutError:
-                    idle += 1
-                    if idle > idle_limit:
-                        error_msg = "WebSocket idle timeout exceeded"
-                        print(f"[WS] ERROR: {error_msg}")
-                        yield {
-                            "event": "error",
-                            "data": json.dumps({"detail": error_msg})
-                        }
-                        return
-                    continue
-
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
-
-                mtype = msg.get("type")
-                data = msg.get("data", {})
-
-                # filter for our prompt
-                if data.get("prompt_id") not in (None, prompt_id):
-                    continue
-
-                if mtype == "progress":
-                    workflow_started = True
-                    v, m = data.get("value", 0), data.get("max", 1)
-                    if m:
-                        pct = round(v / m * 100, 2)
-                        if pct != last_progress:
-                            print(f"[WS] Progress: {pct}%")
-                            yield {
-                                "event": "progress",
-                                "data": json.dumps({
-                                    "percentage": pct,
-                                    "current": v,
-                                    "total": m,
-                                    "message": f"Face swap progress: {pct}%"
-                                })
-                            }
-                            last_progress = pct
-                            
-                elif mtype == "executing":
-                    node_label = data.get("node_label") or data.get("node")
-                    if node_label is None:
-                        # Workflow is idle - if it was started before, it means completion
-                        if workflow_started and not workflow_completed:
-                            workflow_completed = True
-                            print(f"[WS] Terminal status reached: completed. Closing connection.")
-                            yield {
-                                "event": "workflow_status",
-                                "data": json.dumps({
-                                    "final_status": "completed",
-                                    "message": "Face swap completed successfully. Connection closing."
-                                })
-                            }
-                            return
-                        else:
-                            print("[WS] Executing: Idle (no active node)")
-                            yield {
-                                "event": "executing",
-                                "data": json.dumps({
-                                    "node": "idle",
-                                    "message": "Workflow idle (no active node)"
-                                })
-                            }
-                    else:
-                        workflow_started = True
+    async with WS_SEMAPHORE:
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with websockets.connect(
+                    ws_url, 
+                    additional_headers=HEADERS, 
+                    max_size=None,
+                    open_timeout=WS_OPEN_TIMEOUT,
+                    ping_interval=WS_PING_INTERVAL,
+                    ping_timeout=WS_PING_TIMEOUT,
+                    close_timeout=WS_CLOSE_TIMEOUT
+                ) as ws:
+                    while True:
                         try:
-                            node_id = int(node_label)
-                            title = node_titles.get(node_id, f"Node {node_label}")
-                            print(f"[WS] Executing: Node {node_label} ({title})")
-                            yield {
-                                "event": "executing",
-                                "data": json.dumps({
-                                    "node": node_label,
-                                    "title": title,
-                                    "message": f"Executing: {title}"
-                                })
-                            }
-                        except (ValueError, TypeError):
-                            print(f"[WS] Executing: Node {node_label} (invalid node ID)")
-                            yield {
-                                "event": "executing",
-                                "data": json.dumps({
-                                    "node": str(node_label),
-                                    "message": f"Executing Node {node_label}"
-                                })
-                            }
-                            
-                elif mtype == "status":
-                    raw_status = data.get("status")
-                    status = (
-                        raw_status.get("status")
-                        if isinstance(raw_status, dict)
-                        else raw_status
-                    )
-                    if status != last_status:
-                        print(f"[WS] Status: {status}")
-                        yield {
-                            "event": "status_update",
-                            "data": json.dumps({"status": status})
-                        }
-                        last_status = status
-                        
-                    # Handle explicit terminal states (error, failed, cancelled)
-                    if status in {"error", "failed", "cancelled"}:
-                        workflow_completed = True
-                        print(f"[WS] Terminal status reached: {status}. Closing connection.")
-                        yield {
-                            "event": "workflow_status",
-                            "data": json.dumps({
-                                "final_status": status,
-                                "message": f"Face swap {status}. Connection closing."
-                            })
-                        }
-                        return
-                        
-    except Exception as e:
-        error_msg = f"WebSocket connection error: {str(e)}"
-        print(f"[WS] ERROR: {error_msg}")
-        yield {
-            "event": "error", 
-            "data": json.dumps({"detail": error_msg})
-        }
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+                            idle = 0
+                        except asyncio.TimeoutError:
+                            idle += 1
+                            if idle > idle_limit:
+                                error_msg = "WebSocket idle timeout exceeded"
+                                print(f"[WS] ERROR: {error_msg}")
+                                yield {
+                                    "event": "error",
+                                    "data": json.dumps({"detail": error_msg})
+                                }
+                                return
+                            continue
+        
+                        try:
+                            msg = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+        
+                        mtype = msg.get("type")
+                        data = msg.get("data", {})
+        
+                        # filter for our prompt
+                        if data.get("prompt_id") not in (None, prompt_id):
+                            continue
+        
+                        if mtype == "progress":
+                            workflow_started = True
+                            v, m = data.get("value", 0), data.get("max", 1)
+                            if m:
+                                pct = round(v / m * 100, 2)
+                                if pct != last_progress:
+                                    print(f"[WS] Progress: {pct}%")
+                                    yield {
+                                        "event": "progress",
+                                        "data": json.dumps({
+                                            "percentage": pct,
+                                            "current": v,
+                                            "total": m,
+                                            "message": f"Face swap progress: {pct}%"
+                                        })
+                                    }
+                                    last_progress = pct
+                                    
+                        elif mtype == "executing":
+                            node_label = data.get("node_label") or data.get("node")
+                            if node_label is None:
+                                # Workflow is idle - if it was started before, it means completion
+                                if workflow_started and not workflow_completed:
+                                    workflow_completed = True
+                                    print(f"[WS] Terminal status reached: completed. Closing connection.")
+                                    yield {
+                                        "event": "workflow_status",
+                                        "data": json.dumps({
+                                            "final_status": "completed",
+                                            "message": "Face swap completed successfully. Connection closing."
+                                        })
+                                    }
+                                    return
+                                else:
+                                    print("[WS] Executing: Idle (no active node)")
+                                    yield {
+                                        "event": "executing",
+                                        "data": json.dumps({
+                                            "node": "idle",
+                                            "message": "Workflow idle (no active node)"
+                                        })
+                                    }
+                            else:
+                                workflow_started = True
+                                try:
+                                    node_id = int(node_label)
+                                    title = node_titles.get(node_id, f"Node {node_label}")
+                                    print(f"[WS] Executing: Node {node_label} ({title})")
+                                    yield {
+                                        "event": "executing",
+                                        "data": json.dumps({
+                                            "node": node_label,
+                                            "title": title,
+                                            "message": f"Executing: {title}"
+                                        })
+                                    }
+                                except (ValueError, TypeError):
+                                    print(f"[WS] Executing: Node {node_label} (invalid node ID)")
+                                    yield {
+                                        "event": "executing",
+                                        "data": json.dumps({
+                                            "node": str(node_label),
+                                            "message": f"Executing Node {node_label}"
+                                        })
+                                    }
+                                    
+                        elif mtype == "status":
+                            raw_status = data.get("status")
+                            status = (
+                                raw_status.get("status")
+                                if isinstance(raw_status, dict)
+                                else raw_status
+                            )
+                            if status != last_status:
+                                print(f"[WS] Status: {status}")
+                                yield {
+                                    "event": "status_update",
+                                    "data": json.dumps({"status": status})
+                                }
+                                last_status = status
+                                
+                            # Handle explicit terminal states (error, failed, cancelled)
+                            if status in {"error", "failed", "cancelled"}:
+                                workflow_completed = True
+                                print(f"[WS] Terminal status reached: {status}. Closing connection.")
+                                yield {
+                                    "event": "workflow_status",
+                                    "data": json.dumps({
+                                        "final_status": status,
+                                        "message": f"Face swap {status}. Connection closing."
+                                    })
+                                }
+                                return
+            except (asyncio.TimeoutError, websockets.InvalidStatusCode) as exc:
+                wait = BASE_DELAY * 2 ** attempt
+                logger.warning("WS handshake failed (%s). retrying in %ss", exc, wait)
+                await asyncio.sleep(wait)
+            except Exception as e:
+                error_msg = f"WebSocket connection error: {str(e)}"
+                print(f"[WS] ERROR: {error_msg}")
+                yield {
+                    "event": "error", 
+                    "data": json.dumps({"detail": error_msg})
+                }
+    raise RuntimeError("WebSocket handshake failed after retries")
 
 # -----------------------------------------------------------------------------
 # Output File Retrieval
