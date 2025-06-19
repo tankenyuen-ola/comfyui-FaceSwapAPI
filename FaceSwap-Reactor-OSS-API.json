@@ -1,0 +1,315 @@
+{
+  "3": {
+    "inputs": {
+      "enabled": true,
+      "swap_model": "inswapper_128.onnx",
+      "facedetection": "retinaface_resnet50",
+      "face_restore_model": "GFPGANv1.4.pth",
+      "face_restore_visibility": 1,
+      "codeformer_weight": 1,
+      "detect_gender_input": "no",
+      "detect_gender_source": "no",
+      "input_faces_index": "0",
+      "source_faces_index": "0",
+      "console_log_level": 1,
+      "input_image": [
+        "83",
+        0
+      ],
+      "source_image": [
+        "78",
+        0
+      ],
+      "face_boost": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "ReActorFaceSwap",
+    "_meta": {
+      "title": "ReActor 🌌 Fast Face Swap"
+    }
+  },
+  "9": {
+    "inputs": {
+      "frame_rate": [
+        "85",
+        0
+      ],
+      "loop_count": 0,
+      "filename_prefix": "fastfaceswap",
+      "format": "video/h264-mp4",
+      "pix_fmt": "yuv420p",
+      "crf": 20,
+      "save_metadata": false,
+      "trim_to_audio": false,
+      "pingpong": false,
+      "save_output": true,
+      "images": [
+        "3",
+        0
+      ],
+      "audio": [
+        "83",
+        2
+      ]
+    },
+    "class_type": "VHS_VideoCombine",
+    "_meta": {
+      "title": "Video Combine 🎥🅥🅗🅢"
+    }
+  },
+  "11": {
+    "inputs": {
+      "enabled": true,
+      "boost_model": "GPEN-BFR-2048.onnx",
+      "interpolation": "Bicubic",
+      "visibility": 1,
+      "codeformer_weight": 1,
+      "restore_with_main_after": false
+    },
+    "class_type": "ReActorFaceBoost",
+    "_meta": {
+      "title": "ReActor 🌌 Face Booster"
+    }
+  },
+  "43": {
+    "inputs": {
+      "endpoint": [
+        "48",
+        0
+      ],
+      "access_key_id": [
+        "49",
+        0
+      ],
+      "access_key_secret": [
+        "50",
+        0
+      ],
+      "bucket_name": [
+        "51",
+        0
+      ]
+    },
+    "class_type": "InitAliyunOSSConnector|Mie",
+    "_meta": {
+      "title": "Init Aliyun OSS Connector 🐑"
+    }
+  },
+  "44": {
+    "inputs": {
+      "object_name": "",
+      "file_path": [
+        "108",
+        0
+      ],
+      "path_prefix": "",
+      "aliyun_oss_connector": [
+        "43",
+        0
+      ]
+    },
+    "class_type": "AliyunOSSUploadFile|Mie",
+    "_meta": {
+      "title": "Aliyun OSS Upload File 🐑"
+    }
+  },
+  "48": {
+    "inputs": {
+      "env_variable": "ALIYUN_OSS_ENDPOINT"
+    },
+    "class_type": "EnvironmentVariableNode",
+    "_meta": {
+      "title": "Environment Variable Reader"
+    }
+  },
+  "49": {
+    "inputs": {
+      "env_variable": "ALIYUN_ACCESSKEY_ID"
+    },
+    "class_type": "EnvironmentVariableNode",
+    "_meta": {
+      "title": "Environment Variable Reader"
+    }
+  },
+  "50": {
+    "inputs": {
+      "env_variable": "ALIYUN_ACCESSKEY_SECRET"
+    },
+    "class_type": "EnvironmentVariableNode",
+    "_meta": {
+      "title": "Environment Variable Reader"
+    }
+  },
+  "51": {
+    "inputs": {
+      "env_variable": "ALIYUN_BUCKET"
+    },
+    "class_type": "EnvironmentVariableNode",
+    "_meta": {
+      "title": "Environment Variable Reader"
+    }
+  },
+  "57": {
+    "inputs": {
+      "index": -1,
+      "filenames": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "VHS_SelectFilename",
+    "_meta": {
+      "title": "Select Filename 🎥🅥🅗🅢"
+    }
+  },
+  "76": {
+    "inputs": {
+      "path": [
+        "109",
+        0
+      ],
+      "mock": false
+    },
+    "class_type": "DeleteFiles|Mie",
+    "_meta": {
+      "title": "Delete Files 🐑"
+    }
+  },
+  "78": {
+    "inputs": {
+      "filename": "image_bamboo.png",
+      "access_key_id": [
+        "49",
+        0
+      ],
+      "access_key_secret": [
+        "50",
+        0
+      ],
+      "security_token": "",
+      "bucket_name": [
+        "51",
+        0
+      ],
+      "endpoint": [
+        "48",
+        0
+      ]
+    },
+    "class_type": "LoadImageFromOss",
+    "_meta": {
+      "title": "oss2image"
+    }
+  },
+  "79": {
+    "inputs": {
+      "filename": "ThomasShelbyStarboy.mp4",
+      "access_key_id": [
+        "49",
+        0
+      ],
+      "access_key_secret": [
+        "50",
+        0
+      ],
+      "security_token": "",
+      "bucket_name": [
+        "51",
+        0
+      ],
+      "endpoint": [
+        "48",
+        0
+      ]
+    },
+    "class_type": "LoadVideoFromOss",
+    "_meta": {
+      "title": "oss2vid"
+    }
+  },
+  "83": {
+    "inputs": {
+      "video": [
+        "79",
+        0
+      ],
+      "force_rate": 25,
+      "custom_width": 0,
+      "custom_height": 0,
+      "frame_load_cap": 0,
+      "skip_first_frames": 0,
+      "select_every_nth": 1,
+      "format": "None"
+    },
+    "class_type": "VHS_LoadVideoPath",
+    "_meta": {
+      "title": "Load Video (Path) 🎥🅥🅗🅢"
+    }
+  },
+  "85": {
+    "inputs": {
+      "video_info": [
+        "83",
+        3
+      ]
+    },
+    "class_type": "VHS_VideoInfoLoaded",
+    "_meta": {
+      "title": "Video Info (Loaded) 🎥🅥🅗🅢"
+    }
+  },
+  "88": {
+    "inputs": {
+      "console": false,
+      "display": true,
+      "prefix": "",
+      "any_value": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "Show any [Crystools]",
+    "_meta": {
+      "title": "🪛 Show any value to console/display"
+    }
+  },
+  "107": {
+    "inputs": {
+      "console": false,
+      "display": true,
+      "prefix": "",
+      "any_value": [
+        "44",
+        0
+      ]
+    },
+    "class_type": "Show any [Crystools]",
+    "_meta": {
+      "title": "🪛 Show any value to console/display"
+    }
+  },
+  "108": {
+    "inputs": {
+      "key": "FILEPATH",
+      "value": [
+        "57",
+        0
+      ]
+    },
+    "class_type": "Setter",
+    "_meta": {
+      "title": "Set_FILEPATH"
+    }
+  },
+  "109": {
+    "inputs": {
+      "key": "FILEPATH"
+    },
+    "class_type": "Getter",
+    "_meta": {
+      "title": "Get_FILEPATH"
+    }
+  }
+}
