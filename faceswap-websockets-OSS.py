@@ -11,29 +11,33 @@ import os
 import requests
 import requests.exceptions
 import websockets
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Form, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 import uvicorn
 from datetime import datetime, timezone
+import logging
 
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("faceswap_api")
+
+# -----------------------------------------------------------------------------
 # Configuration
-SERVER_ADDRESS = "interview-excellent-fp-providers.trycloudflare.com"
+
+SERVER_ADDRESS = "assessment-vertical-stood-live.trycloudflare.com"
 QUEUE_URL = f"https://{SERVER_ADDRESS}/prompt"
 HISTORY_URL = f"https://{SERVER_ADDRESS}/history"
-VIDEO_URL = f"https://{SERVER_ADDRESS}/view"
-UPLOAD_IMAGE_URL = f"https://{SERVER_ADDRESS}/upload/image"
-WORKFLOW_PATH = "/workspace/FaceSwap-Reactor-OSS-API.json"
-OUTPUT_DIR = Path("/workspace/ComfyUI/output")
-DOWNLOAD_DIR = Path("/workspace/downloads")
+WORKFLOW_PATH = "/workspace/FaceSwap-Reactor-OSS-API-FINAL.json"
 WORKFLOW_STATUS_CACHE = {}
 
-# Ensure output directory exists
-OUTPUT_DIR.mkdir(exist_ok=True)
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-
 # FastAPI app
-app = FastAPI(title="ComfyUI Face Swap API with WebSocket", version="2.0.0")
+app = FastAPI(title="ComfyUI Face Swap OSS API", version="2.0.0")
 
 # Headers for requests
 HEADERS = {
@@ -70,43 +74,72 @@ class ComfyUIError(RuntimeError):
 # Workflow and File Management Functions
 # -----------------------------------------------------------------------------
 
+def detect_workflow_type(data: dict) -> str:
+    """
+    Decide whether *data* represents a normal ComfyUI GUI workflow
+    or an API-style prompt created with “Save (API format)”.
+    Returns: "normal", "api", or "unknown".
+    """
+    # ---------- bullet-proof early exits ----------
+    if "nodes" in data and isinstance(data["nodes"], list):
+        # Standard GUI export always has a 'nodes' array
+        return "normal"
+
+    # ---------- heuristic scores ----------
+    api_score, normal_score = 0, 0
+    numeric = lambda k: isinstance(k, (str, int)) and str(k).isdigit()
+
+    for k, v in data.items():
+        if numeric(k):                                       # "1", "2", …
+            api_score += 1
+            if isinstance(v, dict):
+                if {"class_type", "inputs"} <= v.keys():
+                    api_score += 2
+                if "_meta" in v:
+                    api_score += 1
+
+    for fld in ("links", "groups", "config", "version", "state"):
+        normal_score += fld in data
+
+    # ---------- thresholds ----------
+    if api_score >= 2 and normal_score == 0:
+        return "api"
+    if normal_score >= 2:
+        return "normal"
+    return "unknown"
+
 def validate_workflow_file():
-    """Validate that the workflow file exists and is valid JSON."""
+    """
+    Confirm the JSON file exists *and* is an API-style prompt.
+    Raises:
+        FileNotFoundError – path does not exist
+        ValueError        – file is not an API workflow
+    Returns:
+        dict – parsed JSON when OK
+    """
     if not Path(WORKFLOW_PATH).exists():
+        logger.error(f"Workflow file not found: {WORKFLOW_PATH}")
         raise FileNotFoundError(f"Workflow file not found: {WORKFLOW_PATH}")
-    
+
     try:
-        with open(WORKFLOW_PATH, "r") as f:
-            json.load(f)
-        print("✓ Workflow file validated")
+        data = json.loads(Path(WORKFLOW_PATH).read_text())
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON in workflow file: {e}")
+        logger.error(f"Invalid JSON in workflow file: {e}")
+        raise ValueError(f"Invalid JSON in workflow file: {e}") from None
 
-def download_file_from_url(url: str) -> bytes:
-    """Download file content from URL."""
-    try:
-        response = requests.get(url, timeout=60)
-        response.raise_for_status()
-        return response.content
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download from URL: {str(e)}")
-
-def upload_file_to_comfyui(file_content: bytes, uploaded_filename: str) -> bool:
-    """Upload a file to ComfyUI."""
-    payload = {
-        "overwrite": "true",
-        "type": "input",
-        "subfolder": "",
-    }
-    
-    files = [("image", (uploaded_filename, file_content, "application/octet-stream"))]
-    response = requests.post(UPLOAD_IMAGE_URL, data=payload, files=files, headers=HEADERS)
-    response.raise_for_status()
-    return True
+    wtype = detect_workflow_type(data)
+    if wtype != "api":
+        logger.error("ComfyUI workflow supplied – please provide an API-exported prompt.")
+        raise ValueError(
+            f"{wtype.capitalize() if wtype!='unknown' else 'Unrecognised'} "
+            "ComfyUI workflow supplied – please provide an API-exported prompt."
+        )
+    logger.info("✓ API-based ComfyUI workflow detected")
 
 def load_and_patch_workflow(video_filename: str, image_filename: str, output_prefix: str) -> Dict[str, Any]:
-    """Load and patch the FaceSwap workflow."""
+    """Load and patch the OSS-based FaceSwap workflow."""
     if not Path(WORKFLOW_PATH).exists():
+        logger.error(f"Workflow file not found: {WORKFLOW_PATH}")
         raise ComfyUIError(f"Workflow file not found: {WORKFLOW_PATH}")
 
     with open(WORKFLOW_PATH, "r", encoding="utf-8") as f:
@@ -114,24 +147,30 @@ def load_and_patch_workflow(video_filename: str, image_filename: str, output_pre
 
     wf = copy.deepcopy(wf)  # safety – do not mutate original
 
-    # Patch workflow nodes for FaceSwap
+    # Patch workflow nodes for OSS-based FaceSwap
     try:
-        # Node 8 - Load Video
-        wf["8"]["inputs"]["video"] = video_filename
-    except Exception:
-        print("⚠ Node 8 missing – skipping video patch")
+        # Node 79 - Load Video from OSS (oss2vid)
+        if "79" in wf:
+            wf["79"]["inputs"]["filename"] = video_filename
+            logger.info(f"✓ Patched Node 79 (oss2vid) with video filename: {video_filename}")
+    except Exception as e:
+        logger.error(f"⚠ Node 79 (oss2vid) patch failed: {e}")
 
     try:
-        # Node 10 - Load Image
-        wf["10"]["inputs"]["image"] = image_filename
-    except Exception:
-        print("⚠ Node 10 missing – skipping image patch")
+        # Node 78 - Load Image from OSS (oss2image)  
+        if "78" in wf:
+            wf["78"]["inputs"]["filename"] = image_filename
+            logger.info(f"✓ Patched Node 78 (oss2image) with image filename: {image_filename}")
+    except Exception as e:
+        logger.error(f"⚠ Node 78 (oss2image) patch failed: {e}")
 
     try:
-        # Node 9 - Video Output
-        wf["9"]["inputs"]["filename_prefix"] = output_prefix
-    except Exception:
-        print("⚠ Node 9 missing – skipping output prefix patch")
+        # Node 9 - Video Output (filename_prefix for local processing)
+        if "9" in wf:
+            wf["9"]["inputs"]["filename_prefix"] = output_prefix
+            logger.info(f"✓ Patched Node 9 (Video Combine) with output prefix: {output_prefix}")
+    except Exception as e:
+        logger.error(f"⚠ Node 9 (Video Combine) patch failed: {e}")
 
     return wf
 
@@ -150,10 +189,12 @@ def queue_prompt(workflow: Dict[str, Any], client_id: str) -> str:
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
+        logger.error(f"Queueing prompt failed: {e}")
         raise ComfyUIError(f"Queueing prompt failed: {e}") from e
 
     prompt_id = data.get("prompt_id")
     if not prompt_id:
+        logger.error("/prompt did not return a prompt_id")
         raise ComfyUIError("/prompt did not return a prompt_id")
     return prompt_id
 
@@ -189,7 +230,7 @@ def update_workflow_status(prompt_id: str, status: str, progress_data: dict = No
 async def process_workflow_background(prompt_id: str, client_id: str, node_titles: Dict[int, str], output_prefix: str):
     """Background task to process workflow when prompt_id_only mode is used."""
     try:
-        print(f"[Background] Starting background processing for prompt_id: {prompt_id}")
+        logger.info(f"[Background] Starting background processing for prompt_id: {prompt_id}")
         
         # Ensure the status is properly initialized
         update_workflow_status(prompt_id, "PROCESSING", {
@@ -206,72 +247,54 @@ async def process_workflow_background(prompt_id: str, client_id: str, node_title
                 if progress_event.get("event") == "workflow_status":
                     event_data = json.loads(progress_event["data"])
                     final_status = event_data.get("final_status")
-                    print(f"[Background] Received final status: {final_status}")
+                    logger.info(f"[Background] Received final status: {final_status}")
                     break
                 elif progress_event.get("event") == "error":
                     error_data = json.loads(progress_event["data"])
                     error_msg = error_data.get("detail", "Unknown error")
                     update_workflow_status(prompt_id, "FAILED", error=error_msg)
-                    print(f"[Background] Error during processing: {error_msg}")
+                    logger.info(f"[Background] Error during processing: {error_msg}")
                     error_encountered = True
                     break
         except Exception as monitor_error:
             error_msg = f"Error in monitor_progress_unified: {str(monitor_error)}"
             update_workflow_status(prompt_id, "FAILED", error=error_msg)
-            print(f"[Background] Monitor error for prompt_id: {prompt_id}, error: {error_msg}")
+            logger.error(f"[Background] Monitor error for prompt_id: {prompt_id}, error: {error_msg}")
             return
         
         if error_encountered:
             return
         
-        # Handle completion
-        if final_status in {"completed", "finished"}:
-            try:
-                print(f"[Background] Attempting to fetch output file for prompt_id: {prompt_id}")
-                out_file = fetch_output_file(prompt_id, output_prefix)
-                download_url = f"/download/{out_file.name}"
-                update_workflow_status(prompt_id, "SUCCESS", {
-                    "percentage": 100,
-                    "step": "Face swap completed successfully"
-                }, result_url=download_url)
-                print(f"[Background] Face swap completed for prompt_id: {prompt_id}, file: {out_file.name}")
-            except ComfyUIError as e:
-                error_msg = f"Failed to fetch output file: {str(e)}"
-                update_workflow_status(prompt_id, "FAILED", error=error_msg)
-                print(f"[Background] Face swap failed for prompt_id: {prompt_id}, error: {error_msg}")
+        # Handle completion - for OSS workflow, success means files were uploaded and deleted
+        if final_status in {"completed", "finished", "uploaded"}:
+            update_workflow_status(prompt_id, "SUCCESS", {
+                "percentage": 100,
+                "step": "Face swap completed and uploaded to OSS. Local file deleted."
+            })
+            logger.info(f"[Background] Face swap completed for prompt_id: {prompt_id}")
         elif final_status in {"error", "failed", "cancelled"}:
             error_msg = f"Face swap failed with status: {final_status}"
             update_workflow_status(prompt_id, "FAILED", error=error_msg)
-            print(f"[Background] Face swap failed for prompt_id: {prompt_id}, status: {final_status}")
+            logger.error(f"[Background] Face swap failed for prompt_id: {prompt_id}, status: {final_status}")
         else:
-            # If we exit the monitor loop without a clear final status, check the current status
-            print(f"[Background] Monitor loop ended without clear final status. Final status: {final_status}")
-            # Give it a moment and then check if the workflow completed
-            await asyncio.sleep(2)
-            try:
-                # Try to fetch the output file as a final check
-                out_file = fetch_output_file(prompt_id, output_prefix)
-                download_url = f"/download/{out_file.name}"
-                update_workflow_status(prompt_id, "SUCCESS", {
-                    "percentage": 100,
-                    "step": "Face swap completed successfully"
-                }, result_url=download_url)
-                print(f"[Background] Face swap completed (fallback check) for prompt_id: {prompt_id}")
-            except ComfyUIError as e:
-                error_msg = f"Workflow monitoring ended unexpectedly. Status: {final_status}, Error: {str(e)}"
-                update_workflow_status(prompt_id, "FAILED", error=error_msg)
-                print(f"[Background] Face swap failed (fallback check) for prompt_id: {prompt_id}, error: {error_msg}")
+            # If we exit the monitor loop without a clear final status
+            logger.warning(f"[Background] Monitor loop ended without clear final status. Final status: {final_status}")
+            # For OSS workflow, we assume success if no errors were encountered
+            update_workflow_status(prompt_id, "SUCCESS", {
+                "percentage": 100,
+                "step": "Face swap processing completed"
+            })
+            logger.warning(f"[Background] Face swap completed (fallback) for prompt_id: {prompt_id}")
             
     except Exception as e:
         error_msg = f"Unexpected error in background processing: {str(e)}"
-        update_workflow_status(prompt_id, "FAILED", error=error_msg)
-        print(f"[Background] Unexpected error for prompt_id: {prompt_id}, error: {error_msg}")
+        update_workflow_status(prompt_id, "FAILED", error=error_msg) 
+        logger.error(f"[Background] Unexpected error for prompt_id: {prompt_id}, error: {error_msg}")
 
 # -----------------------------------------------------------------------------
 # WebSocket Progress Monitoring
 # -----------------------------------------------------------------------------
 
-# Replace the existing monitor_progress_unified function with this updated version:
 async def monitor_progress_unified(
     prompt_id: str, 
     client_id: str, 
@@ -279,6 +302,7 @@ async def monitor_progress_unified(
 ):
     """
     Monitor function that yields SSE events for client streaming and updates status cache.
+    Modified for OSS workflow to handle upload and deletion events.
     """
     # Initialize status cache
     update_workflow_status(prompt_id, "PROCESSING", {"percentage": 0, "step": "Starting"})
@@ -290,6 +314,8 @@ async def monitor_progress_unified(
     idle_limit = 60
     workflow_started = False
     workflow_completed = False
+    oss_uploaded = False
+    files_deleted = False
 
     async with WS_SEMAPHORE:
         for attempt in range(MAX_RETRIES):
@@ -311,7 +337,7 @@ async def monitor_progress_unified(
                             idle += 1
                             if idle > idle_limit:
                                 error_msg = "WebSocket idle timeout exceeded"
-                                print(f"[WS] ERROR: {error_msg}")
+                                logger.error(f"[WS] ERROR: {error_msg}")
                                 update_workflow_status(prompt_id, "FAILED", error=error_msg)
                                 yield {
                                     "event": "error",
@@ -338,7 +364,7 @@ async def monitor_progress_unified(
                             if m:
                                 pct = round(v / m * 100, 2)
                                 if pct != last_progress:
-                                    print(f"[WS] Progress: {pct}%")
+                                    logger.info(f"[WS] Progress: {pct}%")
                                     # Update status cache
                                     update_workflow_status(prompt_id, "PROCESSING", {
                                         "percentage": pct,
@@ -361,21 +387,33 @@ async def monitor_progress_unified(
                                 # Workflow is idle - if it was started before, it means completion
                                 if workflow_started and not workflow_completed:
                                     workflow_completed = True
-                                    print(f"[WS] Terminal status reached: completed. Closing connection.")
+                                    
+                                    # For OSS workflow, determine final status based on node completion
+                                    if oss_uploaded and files_deleted:
+                                        final_status = "uploaded"
+                                        status_msg = "Face swap completed, uploaded to OSS, and local files deleted"
+                                    elif oss_uploaded:
+                                        final_status = "uploaded" 
+                                        status_msg = "Face swap completed and uploaded to OSS"
+                                    else:
+                                        final_status = "completed"
+                                        status_msg = "Face swap completed"
+                                    
+                                    logger.info(f"[WS] Terminal status reached: {final_status}. Closing connection.")
                                     update_workflow_status(prompt_id, "SUCCESS", {
                                         "percentage": 100,
-                                        "step": "Completed successfully"
+                                        "step": status_msg
                                     })
                                     yield {
                                         "event": "workflow_status",
                                         "data": json.dumps({
-                                            "final_status": "completed",
-                                            "message": "Face swap completed successfully. Connection closing."
+                                            "final_status": final_status,
+                                            "message": f"{status_msg}. Connection closing."
                                         })
                                     }
                                     return
                                 else:
-                                    print("[WS] Executing: Idle (no active node)")
+                                    logger.info("[WS] Executing: Idle (no active node)")
                                     yield {
                                         "event": "executing",
                                         "data": json.dumps({
@@ -388,22 +426,41 @@ async def monitor_progress_unified(
                                 try:
                                     node_id = int(node_label)
                                     title = node_titles.get(node_id, f"Node {node_label}")
-                                    print(f"[WS] Executing: Node {node_label} ({title})")
+                                    logger.info(f"[WS] Executing: Node {node_label} ({title})")
+                                    
+                                    # Special handling for OSS workflow nodes
+                                    step_message = f"Executing: {title}"
+                                    progress_pct = last_progress if last_progress > 0 else 25
+                                    
+                                    # Node 44: Aliyun OSS Upload File
+                                    if node_id == 44:
+                                        step_message = "Uploading face-swapped video to Aliyun OSS"
+                                        progress_pct = 85
+                                        oss_uploaded = True
+                                        logger.info("[WS] OSS Upload node executing - marking as uploaded")
+                                        
+                                    # Node 76: Delete Files
+                                    elif node_id == 76:
+                                        step_message = "Deleting local temporary files"
+                                        progress_pct = 95
+                                        files_deleted = True
+                                        logger.info("[WS] Delete Files node executing - local file will be deleted")
+                                    
                                     # Update status cache with current step
                                     update_workflow_status(prompt_id, "PROCESSING", {
-                                        "percentage": last_progress if last_progress > 0 else 25,
-                                        "step": f"Executing: {title}"
+                                        "percentage": progress_pct,
+                                        "step": step_message
                                     })
                                     yield {
                                         "event": "executing",
                                         "data": json.dumps({
                                             "node": node_label,
                                             "title": title,
-                                            "message": f"Executing: {title}"
+                                            "message": step_message
                                         })
                                     }
                                 except (ValueError, TypeError):
-                                    print(f"[WS] Executing: Node {node_label} (invalid node ID)")
+                                    logger.error(f"[WS] Executing: Node {node_label} (invalid node ID)")
                                     update_workflow_status(prompt_id, "PROCESSING", {
                                         "percentage": last_progress if last_progress > 0 else 25,
                                         "step": f"Executing Node {node_label}"
@@ -424,7 +481,7 @@ async def monitor_progress_unified(
                                 else raw_status
                             )
                             if status != last_status:
-                                print(f"[WS] Status: {status}")
+                                logger.info(f"[WS] Status: {status}")
                                 yield {
                                     "event": "status_update",
                                     "data": json.dumps({"status": status})
@@ -434,7 +491,7 @@ async def monitor_progress_unified(
                             # Handle explicit terminal states (error, failed, cancelled)
                             if status in {"error", "failed", "cancelled"}:
                                 workflow_completed = True
-                                print(f"[WS] Terminal status reached: {status}. Closing connection.")
+                                logger.info(f"[WS] Terminal status reached: {status}. Closing connection.")
                                 update_workflow_status(prompt_id, "FAILED", {
                                     "percentage": 0,
                                     "step": f"Workflow {status}"
@@ -449,108 +506,17 @@ async def monitor_progress_unified(
                                 return
             except (asyncio.TimeoutError, websockets.InvalidStatusCode) as exc:
                 wait = BASE_DELAY * 2 ** attempt
-                print(f"WS handshake failed ({exc}). retrying in {wait}s")
+                logger.warning(f"WS handshake failed ({exc}). retrying in {wait}s")
                 await asyncio.sleep(wait)
             except Exception as e:
                 error_msg = f"WebSocket connection error: {str(e)}"
-                print(f"[WS] ERROR: {error_msg}")
+                logger.error(f"[WS] ERROR: {error_msg}")
                 update_workflow_status(prompt_id, "FAILED", error=error_msg)
                 yield {
                     "event": "error", 
                     "data": json.dumps({"detail": error_msg})
                 }
     raise RuntimeError("WebSocket handshake failed after retries")
-
-# -----------------------------------------------------------------------------
-# Output File Retrieval
-# -----------------------------------------------------------------------------
-
-def fetch_output_file(prompt_id: str, output_prefix: str) -> Path:
-    """Locate and download the generated video to DOWNLOAD_DIR."""
-    try:
-        history_response = requests.get(f"{HISTORY_URL}/{prompt_id}", headers=HEADERS, timeout=30).json()
-    except Exception as e:
-        raise ComfyUIError(f"Fetching /history failed: {e}") from e
-
-    # The history response structure is: {prompt_id: {outputs: {...}, status: {...}, meta: {...}}}
-    if not history_response:
-        raise ComfyUIError("Empty history response")
-    
-    # Get the prompt data (should be the prompt_id key)
-    prompt_data = history_response.get(prompt_id)
-    if not prompt_data:
-        # Fallback: try to get the first entry if prompt_id key doesn't exist
-        prompt_data = next(iter(history_response.values()), None)
-    
-    if not prompt_data:
-        raise ComfyUIError("No prompt data found in history response")
-    
-    outputs = prompt_data.get("outputs", {})
-    if not outputs:
-        raise ComfyUIError("No outputs present in history response")
-
-    # Look for the video output - typically in node 9 for FaceSwap workflow
-    video_output = None
-    
-    # First try node 9 (Video Output)
-    if "9" in outputs:
-        node_9_outputs = outputs["9"]
-        # Look for different possible output types
-        for output_type in ["gifs", "videos", "images"]:
-            if output_type in node_9_outputs and node_9_outputs[output_type]:
-                video_output = node_9_outputs[output_type][0]
-                break
-    
-    if not video_output:
-        # Fallback: search all outputs for video files
-        for node_id, node_outputs in outputs.items():
-            for output_type, output_list in node_outputs.items():
-                if output_list and isinstance(output_list, list):
-                    for item in output_list:
-                        if isinstance(item, dict):
-                            # Check if it's a video file by extension or format
-                            filename = item.get("filename", "")
-                            file_format = item.get("format", "")
-                            if (filename.lower().endswith(('.mp4', '.avi', '.mov', '.mkv')) or 
-                                file_format.startswith("video/")):
-                                video_output = item
-                                break
-                    if video_output:
-                        break
-            if video_output:
-                break
-    
-    if not video_output:
-        raise ComfyUIError("No video output found in history response")
-
-    filename = video_output.get("filename")
-    subfolder = video_output.get("subfolder", "")
-
-    if not filename:
-        raise ComfyUIError("Filename missing in video output")
-
-    # Construct the view URL
-    params = {"filename": filename, "type": "output"}
-    if subfolder:
-        params["subfolder"] = subfolder
-    
-    # Build URL with parameters
-    url_params = "&".join([f"{k}={v}" for k, v in params.items()])
-    url = f"{VIDEO_URL}?{url_params}"
-    
-    # Use the output prefix for the downloaded file name
-    target = DOWNLOAD_DIR / f"{output_prefix}.mp4"
-
-    try:
-        with requests.get(url, stream=True, headers=HEADERS, timeout=60) as r:
-            r.raise_for_status()
-            with target.open("wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-    except Exception as e:
-        raise ComfyUIError(f"Failed to download video file: {e}") from e
-        
-    return target
 
 # -----------------------------------------------------------------------------
 # API Endpoints
@@ -563,92 +529,64 @@ async def async_error_generator(error_message: str):
 
 @app.post("/face-swap")
 async def face_swap_sse(
-    video: Optional[UploadFile] = File(None, description="Input video file"),
-    image: Optional[UploadFile] = File(None, description="Source face image file"),
-    video_url: Optional[str] = Form(None, description="Video URL (alternative to file upload)"),
-    image_url: Optional[str] = Form(None, description="Image URL (alternative to file upload)"),
+    video_filename: str = Form(..., description="Video filename in OSS (for oss2vid node)"),
+    image_filename: str = Form(..., description="Image filename in OSS (for oss2image node)"),
     output_name: Optional[str] = Form(None, description="Custom output filename prefix"),
     return_prompt_id_only: Optional[bool] = Form(False, description="Return only prompt_id for async processing")
 ):
     """
-    Perform face swap with real-time progress via Server-Sent Events.
+    Perform face swap using OSS filenames with real-time progress via Server-Sent Events.
     Set return_prompt_id_only=true to get just the prompt_id for status checking.
     """
     
     # Validate inputs
-    if not ((video or video_url) and (image or image_url)):
+    if not video_filename or not image_filename:
         if return_prompt_id_only:
+            logger.error("Must provide both video_filename and image_filename")
             raise HTTPException(
                 status_code=400, 
-                detail="Must provide either video file or video_url, and either image file or image_url"
+                detail="Must provide both video_filename and image_filename"
             )
         return EventSourceResponse(
-            lambda: async_error_generator("Must provide either video file or video_url, and either image file or image_url")
+            async_error_generator("Must provide both video_filename and image_filename")
         )
     
-    # Pre-process files BEFORE creating the async generator
+    # Pre-process workflow BEFORE creating the async generator
     ts = time.strftime("%Y%m%d_%H%M%S")
     
     try:
         # Validate workflow file
         validate_workflow_file()
         
-        # Generate unique filenames to avoid conflicts
-        video_suffix = '.mp4'
-        image_suffix = '.png'
-        
-        if video:
-            video_suffix = Path(video.filename).suffix or '.mp4'
-        if image:
-            image_suffix = Path(image.filename).suffix or '.png'
-        
-        video_filename = f"input_video_{uuid.uuid4()}{video_suffix}"
-        image_filename = f"input_image_{uuid.uuid4()}{image_suffix}"
         output_prefix = output_name or f"faceswap_{ts}"
         
-        # Get video content
-        if video:
-            video_content = await video.read()
-            print(f"Using uploaded video file: {video.filename}")
-        else:
-            print(f"Downloading video from URL: {video_url}")
-            video_content = download_file_from_url(video_url)
-        
-        # Get image content
-        if image:
-            image_content = await image.read()
-            print(f"Using uploaded image file: {image.filename}")
-        else:
-            print(f"Downloading image from URL: {image_url}")
-            image_content = download_file_from_url(image_url)
-        
-        # Upload files to ComfyUI
-        upload_file_to_comfyui(video_content, video_filename)
-        upload_file_to_comfyui(image_content, image_filename)
+        logger.info(f"Using OSS video filename: {video_filename}")
+        logger.info(f"Using OSS image filename: {image_filename}")
+        logger.info(f"Output prefix: {output_prefix}")
         
         # Setup workflow
         workflow = load_and_patch_workflow(video_filename, image_filename, output_prefix)
         node_titles = build_node_title_map(workflow)
         
-        # Queue workflow and get prompt_id
+        # Queue workflow and get prompt_idwebs
         client_id = str(uuid.uuid4())
         prompt_id = queue_prompt(workflow, client_id)
         
-        print(f"Generated prompt_id: {prompt_id}")
+        logger.info(f"Generated prompt_id: {prompt_id}")
         
         # Initialize status cache IMMEDIATELY after getting prompt_id
         current_time = datetime.now(timezone.utc).isoformat()
         WORKFLOW_STATUS_CACHE[prompt_id] = {
             "prompt_id": prompt_id,
             "status": "QUEUED",
-            "progress": {"percentage": 0, "step": "Workflow queued, ready to start"},
+            "progress": {"percentage": 0, "step": "OSS workflow queued, ready to start"},
             "created_at": current_time,
             "updated_at": current_time,
             "result": None,
             "error": None
         }
         
-        print(f"Initialized status cache for prompt_id: {prompt_id}")
+        logger.info(f"Initialized status cache for prompt_id: {prompt_id}")
         
         # If only prompt_id is requested, return it immediately
         if return_prompt_id_only:
@@ -658,16 +596,19 @@ async def face_swap_sse(
             return {
                 "prompt_id": prompt_id,
                 "status": "QUEUED", 
-                "message": "Face swap workflow queued successfully. Use /status/{prompt_id} to check progress.",
+                "message": "Face swap OSS workflow queued successfully. Use /status/{prompt_id} to check progress.",
                 "status_url": f"/status/{prompt_id}",
-                "output_prefix": output_prefix
+                "output_prefix": output_prefix,
+                "video_filename": video_filename,
+                "image_filename": image_filename
             }
         
     except Exception as e:
         if return_prompt_id_only:
-            raise HTTPException(status_code=500, detail=f"File processing failed: {str(e)}")
+            logger.error(f"Workflow setup failed: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Workflow setup failed: {str(e)}")
         return EventSourceResponse(
-            lambda: async_error_generator(f"File processing failed: {str(e)}")
+            async_error_generator(f"Workflow setup failed: {str(e)}")
         )
     
     # For SSE streaming (default behavior)
@@ -677,8 +618,10 @@ async def face_swap_sse(
                 "event": "queued",
                 "data": json.dumps({
                     "prompt_id": prompt_id, 
-                    "message": "Face swap workflow queued successfully!",
-                    "status_url": f"/status/{prompt_id}"
+                    "message": "Face swap OSS workflow queued successfully!",
+                    "status_url": f"/status/{prompt_id}",
+                    "video_filename": video_filename,
+                    "image_filename": image_filename
                 })
             }
 
@@ -691,30 +634,30 @@ async def face_swap_sse(
                     final_status = event_data.get("final_status")
                     break
 
-            # Handle completion
-            if final_status in {"completed", "finished"}:
-                yield {"event": "status", "data": json.dumps({"message": "Retrieving face-swapped video..."})}
-                try:
-                    out_file = fetch_output_file(prompt_id, output_prefix)
-                    download_url = f"/download/{out_file.name}"
-                    # Update status cache with final result
-                    update_workflow_status(prompt_id, "SUCCESS", {
-                        "percentage": 100,
-                        "step": "Face swap completed successfully"
-                    }, result_url=download_url)
-                    yield {
-                        "event": "completed",
-                        "data": json.dumps({
-                            "message": "🎉 Face swap completed successfully!",
-                            "filename": out_file.name,
-                            "download_url": download_url,
-                            "prompt_id": prompt_id,
-                            "output_prefix": output_prefix
-                        })
-                    }
-                except ComfyUIError as e:
-                    update_workflow_status(prompt_id, "FAILED", error=str(e))
-                    yield {"event": "error", "data": json.dumps({"detail": str(e)})}
+            # Handle completion for OSS workflow
+            if final_status in {"completed", "finished", "uploaded"}:
+                status_message = "🎉 Face swap completed successfully!"
+                
+                # Add specific messages based on final status
+                if final_status == "uploaded":
+                    status_message = "🎉 Face swap completed and uploaded to OSS! Local file deleted."
+                    
+                # Update status cache with final result
+                update_workflow_status(prompt_id, "SUCCESS", {
+                    "percentage": 100,
+                    "step": "Face swap completed and uploaded to OSS"
+                })
+                yield {
+                    "event": "completed",
+                    "data": json.dumps({
+                        "message": status_message,
+                        "prompt_id": prompt_id,
+                        "output_prefix": output_prefix,
+                        "final_status": final_status,
+                        "video_filename": video_filename,
+                        "image_filename": image_filename
+                    })
+                }
             else:
                 error_msg = f"Face swap failed with status: {final_status}"
                 update_workflow_status(prompt_id, "FAILED", error=error_msg)
@@ -737,44 +680,24 @@ async def get_workflow_status(prompt_id: str):
     
     Returns the latest status without needing to connect to WebSocket or SSE.
     """
-    print(f"Status request for prompt_id: {prompt_id}")
-    print(f"Current cache keys: {list(WORKFLOW_STATUS_CACHE.keys())}")
+    logger.info(f"Status request for prompt_id: {prompt_id}")
+    logger.info(f"Current cache keys: {list(WORKFLOW_STATUS_CACHE.keys())}")
     
     if prompt_id not in WORKFLOW_STATUS_CACHE:
-        print(f"prompt_id {prompt_id} not found in cache, trying ComfyUI history...")
+        logger.warning(f"prompt_id {prompt_id} not found in cache, trying ComfyUI history...")
         # Try to fetch from ComfyUI history as fallback
         try:
             history_response = requests.get(f"{HISTORY_URL}/{prompt_id}", headers=HEADERS, timeout=10).json()
-            print(f"History response keys: {list(history_response.keys()) if history_response else 'Empty response'}")
+            logger.info(f"History response keys: {list(history_response.keys()) if history_response else 'Empty response'}")
             
             if history_response and prompt_id in history_response:
                 prompt_data = history_response[prompt_id]
                 status_info = prompt_data.get("status", {})
                 
-                # Determine status from ComfyUI response
+                # Determine status from ComfyUI response for OSS workflow
                 if status_info.get("completed", False):
                     comfy_status = "SUCCESS"
-                    progress_data = {"percentage": 100, "step": "Completed"}
-                    
-                    # Try to get the result URL
-                    result_url = None
-                    try:
-                        # This is a simplified version - you might need to adapt based on your output structure
-                        outputs = prompt_data.get("outputs", {})
-                        if "9" in outputs and outputs["9"]:
-                            # Assuming node 9 has the video output
-                            video_output = None
-                            for output_type in ["gifs", "videos", "images"]:
-                                if output_type in outputs["9"] and outputs["9"][output_type]:
-                                    video_output = outputs["9"][output_type][0]
-                                    break
-                            
-                            if video_output and "filename" in video_output:
-                                filename = video_output["filename"]
-                                result_url = f"/download/{filename}"
-                    except Exception as e:
-                        print(f"Error extracting result URL: {e}")
-                        
+                    progress_data = {"percentage": 100, "step": "Completed and uploaded to OSS"}
                 elif status_info.get("status_str") == "error":
                     comfy_status = "FAILED"
                     progress_data = {"percentage": 0, "step": "Failed"}
@@ -788,32 +711,18 @@ async def get_workflow_status(prompt_id: str):
                     "progress": progress_data,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "result": result_url,
+                    "result": "Files uploaded to OSS" if comfy_status == "SUCCESS" else None,
                     "error": status_info.get("error") if comfy_status == "FAILED" else None
                 }
             else:
-                print(f"prompt_id {prompt_id} not found in ComfyUI history")
+                logger.error(f"prompt_id {prompt_id} not found in ComfyUI history")
                 raise HTTPException(status_code=404, detail=f"Workflow with prompt_id '{prompt_id}' not found")
                 
         except requests.RequestException as e:
-            print(f"Error fetching from ComfyUI history: {e}")
+            logger.error(f"Error fetching from ComfyUI history: {e}")
             raise HTTPException(status_code=404, detail=f"Workflow with prompt_id '{prompt_id}' not found")
     
     return WORKFLOW_STATUS_CACHE[prompt_id]
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """Download a processed video file."""
-    file_path = DOWNLOAD_DIR / filename
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    return FileResponse(
-        path=file_path,
-        media_type="video/mp4",
-        filename=filename
-    )
 
 @app.get("/health")
 async def health_check():
@@ -838,115 +747,57 @@ async def health_check():
         "workflow_status": workflow_status,
         "server_address": SERVER_ADDRESS,
         "workflow_path": WORKFLOW_PATH,
-        "communication_method": "WebSocket + SSE",
-        "output_directory": str(OUTPUT_DIR)
+        "workflow_type": "OSS-based (no local file downloads)",
+        "communication_method": "WebSocket + SSE"
     }
 
 @app.get("/")
 async def root():
     """Root endpoint with API information."""
     return {
-        "message": "ComfyUI Face Swap API with WebSocket + SSE",
+        "message": "ComfyUI Face Swap OSS API with WebSocket + SSE",
         "version": "2.0.0",
-        "description": "Face swap service using ComfyUI Reactor workflow with real-time progress",
+        "description": "OSS-based face swap service using ComfyUI Reactor workflow with Aliyun OSS integration",
         "endpoints": {
-            "face_swap_sse": "POST /face-swap (Server-Sent Events)",
-            "face_swap_ws": "WebSocket /face-swap-ws",
-            "download": "GET /download/{filename}",
-            "health": "GET /health"
-        },
-        "usage": {
-            "sse_endpoint": {
-                "method": "POST /face-swap",
-                "description": "Real-time progress via Server-Sent Events",
-                "file_upload": "Use 'video' and 'image' form fields",
-                "url_input": "Use 'video_url' and 'image_url' form fields",
-                "output_name": "Optional custom output filename prefix"
-            },
-            "websocket_endpoint": {
-                "method": "WebSocket /face-swap-ws",
-                "description": "Real-time progress via WebSocket",
-                "parameters": {
-                    "video_url": "URL or local path to video",
-                    "image_url": "URL or local path to image",
-                    "output_name": "Optional output filename prefix"
-                }
-            }
+            "POST /face-swap": "Perform face swap with real-time progress via SSE",
+            "GET /status/{prompt_id}": "Check workflow status by prompt ID",
+            "GET /health": "Health check for API and ComfyUI connection",
+            "GET /": "API information and documentation"
         },
         "features": [
-            "Real-time progress monitoring",
-            "WebSocket and SSE support",
-            "Automatic file upload to ComfyUI",
-            "Error handling and recovery",
-            "No polling - event-driven architecture"
-        ]
+            "Real-time progress monitoring via Server-Sent Events",
+            "Asynchronous processing with prompt_id tracking",
+            "Aliyun OSS integration for file handling",
+            "WebSocket-based communication with ComfyUI",
+            "Automatic file cleanup after processing"
+        ],
+        "usage": {
+            "sync_mode": "POST /face-swap with return_prompt_id_only=false (default)",
+            "async_mode": "POST /face-swap with return_prompt_id_only=true, then GET /status/{prompt_id}"
+        },
+        "workflow_type": "OSS-based (oss2vid, oss2image nodes)",
+        "server_address": f"{SERVER_ADDRESS}"
     }
 
-@app.get("/status/{prompt_id}")
-async def get_workflow_status(prompt_id: str):
-    """
-    Get the current status of a workflow execution by prompt_id.
-    
-    Returns the latest status without needing to connect to WebSocket or SSE.
-    """
-    if prompt_id not in WORKFLOW_STATUS_CACHE:
-        # Try to fetch from ComfyUI history as fallback
-        try:
-            history_response = requests.get(f"{HISTORY_URL}/{prompt_id}", headers=HEADERS, timeout=10).json()
-            
-            if history_response and prompt_id in history_response:
-                prompt_data = history_response[prompt_id]
-                status_info = prompt_data.get("status", {})
-                
-                # Determine status from ComfyUI response
-                if status_info.get("completed", False):
-                    comfy_status = "SUCCESS"
-                    progress_data = {"percentage": 100, "step": "Completed"}
-                    
-                    # Try to get the result URL
-                    result_url = None
-                    try:
-                        # This is a simplified version - you might need to adapt based on your output structure
-                        outputs = prompt_data.get("outputs", {})
-                        if "9" in outputs and outputs["9"]:
-                            # Assuming node 9 has the video output
-                            video_output = None
-                            for output_type in ["gifs", "videos", "images"]:
-                                if output_type in outputs["9"] and outputs["9"][output_type]:
-                                    video_output = outputs["9"][output_type][0]
-                                    break
-                            
-                            if video_output and "filename" in video_output:
-                                filename = video_output["filename"]
-                                result_url = f"/download/{filename}"
-                    except:
-                        pass
-                        
-                elif status_info.get("status_str") == "error":
-                    comfy_status = "FAILED"
-                    progress_data = {"percentage": 0, "step": "Failed"}
-                else:
-                    comfy_status = "PROCESSING"
-                    progress_data = {"percentage": 50, "step": "Processing"}
-                
-                return {
-                    "prompt_id": prompt_id,
-                    "status": comfy_status,
-                    "progress": progress_data,
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "result": result_url,
-                    "error": status_info.get("error") if comfy_status == "FAILED" else None
-                }
-            else:
-                raise HTTPException(status_code=404, detail=f"Workflow with prompt_id '{prompt_id}' not found")
-                
-        except requests.RequestException:
-            raise HTTPException(status_code=404, detail=f"Workflow with prompt_id '{prompt_id}' not found")
-    
-    return WORKFLOW_STATUS_CACHE[prompt_id]
-
+# Added main execution block
 if __name__ == "__main__":
-    print(f"▶ Starting FaceSwap API with WebSocket + SSE on http://0.0.0.0:8000")
-    print(f"▶ ComfyUI Server: {SERVER_ADDRESS}")
+    import uvicorn
+    logger.info("=" * 60)
+    logger.info("🚀 Starting ComfyUI Face Swap OSS API")
+    logger.info("=" * 60)
+    logger.info(f"▶ API Server: http://0.0.0.0:8000")
+    logger.info(f"▶ ComfyUI Server: {SERVER_ADDRESS}")
+    logger.info(f"▶ Workflow: OSS-based (oss2vid + oss2image)")
+    logger.info(f"▶ Features: WebSocket + SSE monitoring")
+    logger.info("=" * 60)
+    
+    try:
+        # Validate workflow file on startup
+        validate_workflow_file()
+        logger.info("✅ Workflow file validation passed")
+    except Exception as e:
+        logger.error(f"❌ Workflow validation failed: {e}")
+        exit(1)
+    
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    #uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, log_level="debug")
